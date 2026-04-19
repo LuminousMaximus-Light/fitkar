@@ -1,0 +1,166 @@
+/**
+ * FitKar — AI Virtual Try-On Backend
+ * Node.js + Express → Replicate API (IDM-VTON)
+ *
+ * Setup:
+ *   npm install express cors node-fetch@2
+ *   REPLICATE_API_TOKEN=r8_xxx node server.js
+ */
+
+const express = require('express');
+const cors = require('cors');
+const fetch = require('node-fetch');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const REPLICATE_TOKEN = process.env.REPLICATE_API_TOKEN || '';
+
+// ── Middleware ─────────────────────────────────────────────────────────────
+app.use(cors());
+app.use(express.json({ limit: '50mb' })); // large enough for base64 images
+app.use(express.static('.')); // serve index.html from same folder if needed
+
+// ── Health check ──────────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', hasToken: Boolean(REPLICATE_TOKEN) });
+});
+
+// ── /tryon endpoint ───────────────────────────────────────────────────────
+/**
+ * POST /tryon
+ * Body (JSON):
+ *   {
+ *     personImage: string   // base64 (no data: prefix)
+ *     clothImage:  string   // base64 (no data: prefix)
+ *     personMime?: string   // e.g. "image/jpeg"
+ *     garmentMime?: string
+ *   }
+ * Returns:
+ *   { resultUrl: string }
+ */
+app.post('/tryon', async (req, res) => {
+  const { personImage, clothImage, personMime = 'image/jpeg', garmentMime = 'image/jpeg' } = req.body;
+
+  if (!personImage || !clothImage) {
+    return res.status(400).json({ error: 'personImage and clothImage are required' });
+  }
+
+  if (!REPLICATE_TOKEN) {
+    return res.status(500).json({ error: 'Server not configured: missing REPLICATE_API_TOKEN env variable' });
+  }
+
+  try {
+    // Rebuild data URIs
+    const humanImgUri = `data:${personMime};base64,${personImage}`;
+    const garmImgUri  = `data:${garmentMime};base64,${clothImage}`;
+
+    console.log('[FitKar] Starting try-on prediction…');
+
+    // ── Create prediction ────────────────────────────────────────────────
+    const createBody = {
+      // IDM-VTON model (best quality virtual try-on)
+      version: '906425dbca90663ff5427624839572cc56ea7d380343d13e2a4c4b09d3f0c30f',
+      input: {
+        human_img: humanImgUri,
+        garm_img: garmImgUri,
+        garment_des: 'clothing item',
+        is_checked: true,
+        is_checked_crop: false,
+        denoise_steps: 30,
+        seed: 42,
+      },
+    };
+
+    const createRes = await fetch('https://api.replicate.com/v1/predictions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Token ${REPLICATE_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(createBody),
+    });
+
+    if (!createRes.ok) {
+      const errData = await createRes.json().catch(() => ({}));
+      console.error('[FitKar] Replicate create error:', errData);
+      return res.status(502).json({ error: errData.detail || 'Failed to start AI prediction' });
+    }
+
+    const prediction = await createRes.json();
+    console.log('[FitKar] Prediction created:', prediction.id);
+
+    // ── Poll for result ──────────────────────────────────────────────────
+    const resultUrl = await pollUntilDone(prediction.id, prediction.urls?.get);
+    console.log('[FitKar] Result ready:', resultUrl);
+
+    return res.json({ resultUrl });
+
+  } catch (err) {
+    console.error('[FitKar] Error:', err.message);
+    return res.status(500).json({ error: err.message || 'Internal server error' });
+  }
+});
+
+// ── Polling helper ─────────────────────────────────────────────────────────
+async function pollUntilDone(predictionId, pollUrl, maxAttempts = 60, intervalMs = 5000) {
+  const url = pollUrl || `https://api.replicate.com/v1/predictions/${predictionId}`;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await delay(intervalMs);
+
+    const res = await fetch(url, {
+      headers: { Authorization: `Token ${REPLICATE_TOKEN}` },
+    });
+
+    if (!res.ok) throw new Error(`Polling failed with status ${res.status}`);
+
+    const data = await res.json();
+    console.log(`[FitKar] Poll #${attempt}: ${data.status}`);
+
+    if (data.status === 'succeeded') {
+      const output = Array.isArray(data.output) ? data.output[0] : data.output;
+      if (!output) throw new Error('Prediction succeeded but output is empty');
+      return output;
+    }
+
+    if (data.status === 'failed' || data.status === 'canceled') {
+      throw new Error(`Prediction ${data.status}: ${data.error || 'Unknown error'}`);
+    }
+    // status: 'starting' | 'processing' → keep polling
+  }
+
+  throw new Error('Timed out after waiting for AI result (5 minutes)');
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ── Fallback: OOTDiffusion (alternative model) ─────────────────────────────
+// Uncomment & swap version string below if IDM-VTON is unavailable:
+//
+// version: 'levihsu/ootdiffusion:...'
+// input: {
+//   human_img: humanImgUri,
+//   cloth_img: garmImgUri,
+//   model_type: 'hd',
+//   n_samples: 1,
+//   n_steps: 20,
+//   image_scale: 2.0,
+//   seed: -1,
+// }
+
+// ── Start server ───────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`
+╔══════════════════════════════════╗
+║   FitKar AI Backend Running      ║
+║   http://localhost:${PORT}          ║
+║   Token: ${REPLICATE_TOKEN ? '✅ configured' : '❌ missing'}           ║
+╚══════════════════════════════════╝
+  `);
+  if (!REPLICATE_TOKEN) {
+    console.warn('⚠️  Set REPLICATE_API_TOKEN env variable to enable AI try-on.');
+    console.warn('   Get your token at: https://replicate.com/account/api-tokens');
+  }
+});
